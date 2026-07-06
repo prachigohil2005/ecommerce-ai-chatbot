@@ -1,0 +1,57 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-brand-950 text-slate-100 font-sans antialiased selection:bg-brand-500 selection:text-white;
+    background-image: 
+      radial-gradient(at 0% 0%, rgba(53, 97, 164, 0.15) 0px, transparent 50%),
+      radial-gradient(at 100% 100%, rgba(244, 63, 94, 0.05) 0px, transparent 50%);
+    background-attachment: fixed;
+  }
+}
+
+/* Custom premium design system components */
+@layer components {
+  .glass-card {
+    @apply bg-brand-950/45 backdrop-blur-md border border-brand-100/10 shadow-xl shadow-brand-950/50;
+  }
+  
+  .glass-card-hover {
+    @apply transition-all duration-300 hover:bg-brand-950/40 hover:border-brand-500/30 hover:shadow-brand-500/5;
+  }
+
+  .interactive-button {
+    @apply relative overflow-hidden transition-all duration-300 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none;
+  }
+
+  .gradient-text {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-brand-300 via-brand-400 to-accent-500;
+  }
+  
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-brand-800/60 rounded-full hover:bg-brand-700/80;
+  }
+}
+
+/* Loading animations */
+.pulse-slow {
+  animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .5; }
+}
