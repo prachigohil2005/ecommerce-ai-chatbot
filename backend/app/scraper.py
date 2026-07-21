@@ -116,9 +116,15 @@ class FlipkartScraper:
             gender_match = re.search(r"(men|women|boys|girls|unisex)", text_lower)
             specs["gender"] = gender_match.group(0).capitalize() if gender_match else "Men"
             
+            # Women's apparel overrides
+            if any(w in text_lower for w in ["saree", "sari", "sadi", "dress", "lehenga", "kurti", "frock", "gown", "maxi"]):
+                specs["gender"] = "Women"
+            
             style_match = re.search(r"(casual|formal|streetwear|sportswear)", text_lower)
             specs["style"] = style_match.group(0).capitalize() if style_match else "Casual"
-            specs["color"] = "Navy Blue"
+            
+            color_match = re.search(r"\b(red|blue|black|green|white|yellow|pink|grey|brown|purple|orange|gold|silver|navy|maroon|beige|khaki)\b", text_lower)
+            specs["color"] = color_match.group(1).capitalize() if color_match else "Navy Blue"
             specs["size"] = "M"
 
         elif category == "Shoes":
@@ -152,6 +158,11 @@ class FlipkartScraper:
             specs["type"] = type_match.group(0).capitalize() if type_match else "Smartwatch"
             specs["compatibility"] = "Android & iOS"
             specs["material"] = "Alloy & Silicone"
+
+        # General color extraction fallback for all categories
+        color_match = re.search(r"\b(red|blue|black|green|white|yellow|pink|grey|brown|purple|orange|gold|silver|navy|maroon|beige|khaki)\b", text_lower)
+        if color_match and "color" not in specs:
+            specs["color"] = color_match.group(1).capitalize()
 
         return specs
 
@@ -220,26 +231,39 @@ class FlipkartScraper:
                                     continue
                                 seen_urls.add(product_url)
                                 
-                                # Trace up to find card container div containing price info
+                                 # Trace up to find card container div containing price info
                                 parent = a.parent
                                 card = None
                                 while parent and parent.name != 'body':
-                                    if "₹" in parent.text and len(parent.text) < 1500:
-                                        card = parent
+                                    # Ensure the parent does not bleed into adjacent product cards in the grid row
+                                    product_links = {
+                                        a_link['href'].split("?")[0] 
+                                        for a_link in parent.find_all("a", href=True) 
+                                        if "/p/" in a_link['href']
+                                    }
+                                    if len(product_links) > 1:
                                         break
+                                        
+                                    if "₹" in parent.text:
+                                        card = parent
                                     parent = parent.parent
                                     
                                 if not card:
                                     continue
                                 
-                                # 1. Title (Extract from img alt tags inside card since alt matches product title exactly)
+                                # 1. Title (Extract from URL path slug)
                                 title = ""
-                                img = card.find("img")
-                                if img and img.get("alt"):
-                                    title = img.get("alt").strip()
+                                url_path = href.split("?")[0].strip("/")
+                                if "/p/" in href:
+                                    slug = url_path.split("/p/")[0].split("/")[-1]
+                                    title = " ".join([word.capitalize() for word in slug.split("-")])
                                 
-                                if not title and a.text.strip():
-                                    title = a.text.strip()
+                                if not title:
+                                    img = card.find("img")
+                                    if img and img.get("alt"):
+                                        title = img.get("alt").strip()
+                                    if not title and a.text.strip():
+                                        title = a.text.strip()
                                     
                                 if not title or len(title) < 15:
                                     continue # skip trash entries
@@ -350,6 +374,219 @@ class FlipkartScraper:
                     driver.quit()
                 except Exception as ex:
                     logger.warning(f" geckodriver exit permission error: {str(ex)}")
+                    
+        return products
+
+    def scrape_query(self, query: str, category: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Scrapes live products from Flipkart for a specific user query using headless Selenium."""
+        logger.info(f"Dynamically scraping Flipkart for query: '{query}', category: '{category}'...")
+        
+        # Configure Selenium Webdriver
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        
+        service = Service("/snap/bin/geckodriver")
+        driver = None
+        products = []
+        
+        # Mapping of categories to brands database to match brand names
+        brands_db = {
+            "Smartphones": ["Samsung", "Apple", "OnePlus", "Vivo", "Oppo", "Realme", "HMD", "Xiaomi", "Redmi", "Motorola", "Google", "iQOO", "Poco", "Infinix", "Nothing"],
+            "Laptops": ["Dell", "HP", "Lenovo", "ASUS", "Apple", "Acer", "MSI", "Infinix", "LG"],
+            "Fashion": ["Levi's", "Zara", "H&M", "Roadster", "Tommy Hilfiger", "Allen Solly", "Van Heusen", "Peter England", "Jack & Jones", "U.S. Polo", "Puma", "Adidas"],
+            "Shoes": ["Nike", "Adidas", "Puma", "Reebok", "Under Armour", "Asics", "Skechers", "Bata", "Woodland", "Red Tape", "Campus", "Sparx"],
+            "Skincare": ["The Derma Co", "Minimalist", "Neutrogena", "Cetaphil", "Plum", "L'Oreal", "Nivea", "Mamaearth", "Biotique", "Lotus", "Garnier"],
+            "Fitness": ["Boldfit", "Decathlon", "MuscleBlaze", "Cockatoo", "Lifelong", "Cultsport", "Nivia", "Cosco", "Stryder"],
+            "Accessories": ["Boat", "JBL", "Noise", "Sony", "Wildcraft", "OnePlus", "Apple", "Portronics", "Boult", "Zebronics", "Realme"]
+        }
+        
+        cat = category if category in brands_db else "Fashion"
+        brands = brands_db.get(cat, ["Generic"])
+        
+        try:
+            driver = webdriver.Firefox(options=options, service=service)
+            url = f"https://www.flipkart.com/search?q={requests.utils.quote(query)}"
+            logger.info(f"Loading search page: {url}")
+            
+            driver.get(url)
+            time.sleep(random.uniform(3.0, 5.0)) # request throttling
+            
+            html = driver.page_source
+            soup = BeautifulSoup(html, "html.parser")
+            
+            # Find all anchors that are product detail pages
+            anchors = [a for a in soup.find_all("a", href=True) if "/p/" in a['href']]
+            logger.info(f"Found {len(anchors)} potential links on search page for '{query}'")
+            
+            seen_urls = set()
+            for a in anchors:
+                if len(products) >= limit:
+                    break
+                    
+                href = a['href']
+                product_url = "https://www.flipkart.com" + href.split("?")[0]
+                if product_url in seen_urls:
+                    continue
+                seen_urls.add(product_url)
+                
+                # Trace up to find card container div containing price info
+                parent = a.parent
+                card = None
+                while parent and parent.name != 'body':
+                    # Ensure the parent does not bleed into adjacent product cards in the grid row
+                    product_links = {
+                        a_link['href'].split("?")[0] 
+                        for a_link in parent.find_all("a", href=True) 
+                        if "/p/" in a_link['href']
+                    }
+                    if len(product_links) > 1:
+                        break
+                        
+                    if "₹" in parent.text:
+                        card = parent
+                    parent = parent.parent
+                    
+                if not card:
+                    continue
+                
+                # 1. Title (Extract from URL path slug)
+                title = ""
+                url_path = href.split("?")[0].strip("/")
+                if "/p/" in href:
+                    slug = url_path.split("/p/")[0].split("/")[-1]
+                    title = " ".join([word.capitalize() for word in slug.split("-")])
+                
+                if not title:
+                    img = card.find("img")
+                    if img and img.get("alt"):
+                        title = img.get("alt").strip()
+                    if not title and a.text.strip():
+                        title = a.text.strip()
+                    
+                if not title or len(title) < 15:
+                    continue
+                    
+                # 2. Image URL
+                image_url = ""
+                for im in card.find_all("img"):
+                    src = im.get("src", "")
+                    if src.startswith("http") and "rukminim" in src:
+                        image_url = src
+                        break
+                        
+                # If no image URL, skip
+                if not image_url:
+                    continue
+                    
+                # 3. Product ID
+                pid_match = re.search(r"pid=([\w\d]+)", href)
+                product_id = pid_match.group(1) if pid_match else "FLIP" + str(random.randint(1000000, 9999999))
+                
+                # 4. Brand Matching
+                brand = "Generic"
+                for b in brands:
+                    if b.lower() in title.lower():
+                        brand = b
+                        break
+                if brand == "Generic":
+                    brand = title.split()[0]
+                    
+                # 5. Pricing
+                prices_raw = re.findall(r"₹(\d{1,3}(?:,\d{3})*)", card.text)
+                if len(prices_raw) >= 1:
+                    selling_price = float(prices_raw[0].replace(",", ""))
+                else:
+                    continue
+                    
+                if len(prices_raw) >= 2:
+                    original_price = float(prices_raw[1].replace(",", ""))
+                else:
+                    original_price = selling_price
+                    
+                discount_percentage = 0.0
+                if original_price > selling_price:
+                    discount_percentage = round(((original_price - selling_price) / original_price) * 100.0, 1)
+                    
+                # 6. Rating and Review counts
+                rating = 4.0
+                rating_match = re.search(r"\b([1-5]\.[0-9])\b", card.text)
+                if rating_match:
+                    rating = float(rating_match.group(1))
+                    
+                review_count = random.randint(15, 3500)
+                reviews_match = re.search(r"(\d+(?:,\d{3})*)\s*Reviews", card.text, re.IGNORECASE)
+                if reviews_match:
+                    review_count = int(reviews_match.group(1).replace(",", ""))
+                else:
+                    ratings_match = re.search(r"(\d+(?:,\d{3})*)\s*Ratings", card.text, re.IGNORECASE)
+                    if ratings_match:
+                        review_count = max(5, int(ratings_match.group(1).replace(",", "")) // 10)
+                        
+                # 7. Specifications JSON
+                specs = self.parse_specs_from_text(card.text, cat)
+                
+                 # Override parsed specs gender using explicit title keywords
+                title_lower = title.lower()
+                if re.search(r"\b(women|female|girl|girls|lady|ladies)\b", title_lower):
+                    specs["gender"] = "Women"
+                elif re.search(r"\b(men|male|boy|boys|gent|gents)\b", title_lower):
+                    specs["gender"] = "Men"
+                elif "unisex" in title_lower:
+                    specs["gender"] = "Unisex"
+                    
+                # Override parsed specs color using explicit title keywords
+                for c_word in ["red", "blue", "black", "green", "white", "yellow", "pink", "grey", "brown", "purple", "orange", "gold", "silver", "navy", "maroon", "beige", "khaki"]:
+                    if re.search(rf"\b{c_word}\b", title_lower):
+                        specs["color"] = c_word.capitalize()
+                        break
+                
+                # Double check that if the user search query contained a specific color, we assign it
+                # if not extracted by parse_specs_from_text
+                query_lower = query.lower()
+                for c_word in ["red", "blue", "black", "green", "white", "yellow", "pink", "grey", "brown", "purple", "orange", "gold", "silver", "navy", "maroon", "beige", "khaki"]:
+                    if c_word in query_lower:
+                        specs["color"] = c_word.capitalize()
+                        break
+                        
+                specifications_json = json.dumps(specs)
+                
+                # 8. Description and subcategory
+                subcat = f"{cat.lower()} dynamic"
+                description = (
+                    f"Buy the latest {title} online at best prices. This authentic product from {brand} "
+                    f"is ideal for your daily {cat.lower()} requirements. Features key aspects: {', '.join([f'{k}: {v}' for k, v in specs.items()])}."
+                )
+                
+                product_row = {
+                    "product_id": product_id,
+                    "product_title": title,
+                    "category": cat,
+                    "subcategory": subcat,
+                    "brand": brand,
+                    "selling_price": selling_price,
+                    "original_price": original_price,
+                    "discount_percentage": discount_percentage,
+                    "rating": rating,
+                    "review_count": review_count,
+                    "description": description,
+                    "specifications": specifications_json,
+                    "availability": "In Stock",
+                    "product_url": product_url,
+                    "image_url": image_url
+                }
+                products.append(product_row)
+                logger.info(f"Dynamically scraped product: {title} | Price: ₹{selling_price}")
+                
+        except Exception as e:
+            logger.error(f"Error dynamically scraping query '{query}': {str(e)}")
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception as ex:
+                    logger.warning(f"geckodriver exit permission error: {str(ex)}")
                     
         return products
 

@@ -26,6 +26,13 @@ class Settings:
     # Embedding config
     EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
     
+    # Hybrid Ranking Weights
+    HYBRID_WEIGHT_SEMANTIC: float = 0.45
+    HYBRID_WEIGHT_INTENT: float = 0.30
+    HYBRID_WEIGHT_RATING: float = 0.10
+    HYBRID_WEIGHT_POPULARITY: float = 0.10
+    HYBRID_WEIGHT_AVAILABILITY: float = 0.05
+    
     # Server port
     PORT: int = int(os.getenv("PORT", 8000))
 

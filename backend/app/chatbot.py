@@ -38,38 +38,131 @@ YOUR PERSONA & INSTRUCTIONS:
 7. Avoid database technical jargon like "FAISS", "retrieved documents", "score", "context", or "embeddings".
 """
         
-        # Configure Gemini API
-        if self.api_key:
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction=self.system_instruction
-            )
-            logger.info("Gemini API configured successfully with System Instructions.")
-        else:
-            self.model = None
-            logger.warning("GEMINI_API_KEY not found in configuration. Chatbot will run in OFFLINE/MOCK fallback mode.")
+        # Initialize LLM rotating gateway
+        from .llm_gateway import LLMGateway
+        self.gateway = LLMGateway()
 
-    def parse_budget(self, text: str) -> Optional[float]:
-        """Rule-based regex backup for budget extraction (e.g. 'under 40000', 'under 50k')."""
+    def is_couple_query(self, query: str) -> bool:
+        q_lower = query.lower()
+        couple_indicators = ["bride and groom", "couple", "men and women", "his and hers", "husband and wife"]
+        return any(ind in q_lower for ind in couple_indicators)
+
+    def _perform_dual_search(self, query: str, category: Optional[str], min_budget: Optional[float], max_budget: Optional[float], brand: Optional[str], exclude_brands: List[str], negated_features: List[str], color: Optional[str], size: Optional[str]) -> List[Dict[str, Any]]:
+        # 1. Determine women's query and men's query
+        q_lower = query.lower()
+        
+        women_q = query
+        men_q = query
+        
+        # Replace common couple phrases
+        if "bride and groom" in q_lower:
+            women_q = re.sub(r"\bbride and groom\b", "bride", query, flags=re.IGNORECASE)
+            men_q = re.sub(r"\bbride and groom\b", "groom", query, flags=re.IGNORECASE)
+        elif "groom and bride" in q_lower:
+            women_q = re.sub(r"\bgroom and bride\b", "bride", query, flags=re.IGNORECASE)
+            men_q = re.sub(r"\bgroom and bride\b", "groom", query, flags=re.IGNORECASE)
+        else:
+            # General keywords removal
+            if "groom" in q_lower:
+                women_q = re.sub(r"\bgroom\b", "", query, flags=re.IGNORECASE).strip()
+            if "bride" in q_lower:
+                men_q = re.sub(r"\bbride\b", "", query, flags=re.IGNORECASE).strip()
+                
+            if "couple" in q_lower:
+                women_q = re.sub(r"\bcouple\b", "women", women_q, flags=re.IGNORECASE)
+                men_q = re.sub(r"\bcouple\b", "men", men_q, flags=re.IGNORECASE)
+            elif "husband and wife" in q_lower:
+                women_q = re.sub(r"\bhusband and wife\b", "women", women_q, flags=re.IGNORECASE)
+                men_q = re.sub(r"\bhusband and wife\b", "men", men_q, flags=re.IGNORECASE)
+            elif "men and women" in q_lower:
+                women_q = re.sub(r"\bmen and women\b", "women", women_q, flags=re.IGNORECASE)
+                men_q = re.sub(r"\bmen and women\b", "men", men_q, flags=re.IGNORECASE)
+            elif "women and men" in q_lower:
+                women_q = re.sub(r"\bwomen and men\b", "women", women_q, flags=re.IGNORECASE)
+                men_q = re.sub(r"\bwomen and men\b", "men", men_q, flags=re.IGNORECASE)
+            else:
+                # Fallback if no specific keywords matched
+                women_q = f"{query} women"
+                men_q = f"{query} men"
+                
+        # Clean double spaces
+        women_q = re.sub(r"\s+", " ", women_q).strip()
+        men_q = re.sub(r"\s+", " ", men_q).strip()
+        
+        logger.info(f"Couple query split search: Women query='{women_q}', Men query='{men_q}'")
+        
+        # 2. Search women
+        women_results = self.search_engine.search(
+            query=women_q,
+            category_filter=category,
+            min_budget_filter=min_budget,
+            max_budget_filter=max_budget,
+            brand_filter=brand,
+            top_k=4,
+            exclude_brands=exclude_brands,
+            negated_features=negated_features,
+            color_filter=color,
+            size_filter=size,
+            gender_filter="women"
+        )
+        
+        # 3. Search men
+        men_results = self.search_engine.search(
+            query=men_q,
+            category_filter=category,
+            min_budget_filter=min_budget,
+            max_budget_filter=max_budget,
+            brand_filter=brand,
+            top_k=4,
+            exclude_brands=exclude_brands,
+            negated_features=negated_features,
+            color_filter=color,
+            size_filter=size,
+            gender_filter="men"
+        )
+        
+        # 4. Interleave or merge results
+        merged = []
+        for w, m in zip(women_results, men_results):
+            merged.append(w)
+            merged.append(m)
+            
+        # Add remainders
+        if len(women_results) > len(men_results):
+            merged.extend(women_results[len(men_results):])
+        elif len(men_results) > len(women_results):
+            merged.extend(men_results[len(women_results):])
+            
+        return merged
+
+    def parse_budget_range(self, text: str) -> Tuple[Optional[float], Optional[float]]:
+        """Parses price budget bounds (min_budget, max_budget) from the text query using rule-based regex backup."""
         text = text.lower()
         
+        # Match range pattern like "2000 to 5000", "2000-5000", "between 2000 and 5000"
+        range_match = re.search(r"\b(?:range|between|from|in the range of)?\s*(?:rs\.?|inr|₹)?\s*(\d+)\s*(?:to|and|\-)\s*(?:rs\.?|inr|₹)?\s*(\d+)\b", text)
+        if range_match:
+            val1 = float(range_match.group(1))
+            val2 = float(range_match.group(2))
+            return min(val1, val2), max(val1, val2)
+            
+        # Fallback to single upper limit budget
         # Match pattern "under 40000", "under rs 40000", "below 40k", etc.
         # Handle 'k' multiplier (e.g. 40k -> 40000)
         k_matches = re.findall(r"(?:under|below|under rs\.?|budget of|within|less than)\s*(\d+)\s*k\b", text)
         if k_matches:
-            return float(k_matches[0]) * 1000.0
+            return None, float(k_matches[0]) * 1000.0
             
         numeric_matches = re.findall(r"(?:under|below|under rs\.?|budget of|within|less than|max|maximum)\s*(?:rs\.?|inr|₹)?\s*(\d+)", text)
         if numeric_matches:
-            return float(numeric_matches[0])
+            return None, float(numeric_matches[0])
             
         # Match simple "under ₹40,000" or similar
         comma_matches = re.findall(r"(?:under|below|within|less than)\s*(?:rs\.?|inr|₹)?\s*(\d{1,3}(?:,\d{3})+)", text)
         if comma_matches:
-            return float(comma_matches[0].replace(",", ""))
+            return None, float(comma_matches[0].replace(",", ""))
             
-        return None
+        return None, None
 
     def extract_category_rule_based(self, text: str) -> Optional[str]:
         """Rule-based backup for category extraction."""
@@ -475,11 +568,21 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
             data["category"] = None
             data["intent"] = "out_of_scope"
             data["is_out_of_scope"] = True
-        elif not data.get("category"):
-            data["category"] = fallback["category"]
+        else:
+            cat_val = data.get("category")
+            valid_cats = ["Smartphones", "Laptops", "Fashion", "Shoes", "Skincare", "Fitness", "Accessories"]
+            if not cat_val or str(cat_val).strip() not in valid_cats:
+                data["category"] = fallback.get("category")
             
-        if not data.get("budget"):
-            data["budget"] = fallback["budget"]
+        # Backwards-compatibility mapping safety net
+        if "budget" in data and data["budget"] is not None:
+            if "max_budget" not in data or data["max_budget"] is None:
+                data["max_budget"] = data["budget"]
+
+        if "min_budget" not in data or data["min_budget"] is None:
+            data["min_budget"] = fallback.get("min_budget")
+        if "max_budget" not in data or data["max_budget"] is None:
+            data["max_budget"] = fallback.get("max_budget")
         if not data.get("search_query"):
             data["search_query"] = fallback["search_query"]
         if "exclude_brands" not in data or not data["exclude_brands"]:
@@ -490,8 +593,13 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
             data["color"] = fallback["color"]
         if not data.get("size"):
             data["size"] = fallback["size"]
-        if not data.get("gender"):
-            data["gender"] = fallback["gender"]
+            
+        gender_val = data.get("gender")
+        if not gender_val or str(gender_val).lower() not in ["men", "women", "unisex"]:
+            data["gender"] = fallback.get("gender")
+        else:
+            data["gender"] = str(gender_val).lower()
+            
         if not data.get("intent"):
             data["intent"] = fallback["intent"]
         if "comparison_targets" not in data or not data["comparison_targets"]:
@@ -602,10 +710,20 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
         prev_place = None
         prev_occasion = None
         prev_brand = None
+        prev_noun = None
+        
+        product_nouns = ["saree", "sari", "sadi", "shirt", "jeans", "t-shirt", "tshirt", "dress", "jacket", "suit", "lehenga", "kurta", "laptop", "phone", "smartphone", "dumbbell", "yoga mat", "water bottle", "headphone", "earbud", "watch", "smartwatch", "backpack", "sunscreen", "rose water", "face wash", "facewash", "serum", "moisturizer", "cleanser", "toner", "frock"]
         
         # Scan history from most recent to oldest
         for turn in reversed(history):
             content = turn.get("content", "").lower()
+            
+            # Find previous product noun if user turn
+            if turn.get("role") == "user" and not prev_noun:
+                for noun in product_nouns:
+                    if noun in content:
+                        prev_noun = noun
+                        break
             
             # Extract category from previous messages
             if not prev_category:
@@ -804,6 +922,12 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
             search_query_val = "shorts dress maxi t-shirt beachwear floral"
         elif any(w in q_lower for w in ["interview", "office", "formal"]) or any(w in occ_lower for w in ["interview", "office", "formal"]):
             search_query_val = "formal shirt trousers suit blazer coat"
+        elif any(w in q_lower for w in ["pant", "trouser", "jeans", "bottom", "leggings", "chinos"]):
+            search_query_val = "trousers pants jeans bottom leggings chinos"
+        elif any(w in q_lower for w in ["bag", "backpack"]):
+            search_query_val = "backpack school bag college travel bag"
+        elif any(w in q_lower for w in ["shoe", "footwear", "sneaker", "sandal", "slipper", "boot"]):
+            search_query_val = "shoes sneakers formal boots sandals footwear"
         else:
             # Short query refinement logic
             if len(query.split()) <= 2:
@@ -818,10 +942,43 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
                     parts.append("shoes sneakers")
                 search_query_val = " ".join(parts)
 
+        # Elliptical query carry-over refinement
+        # Only carry over the previous noun if the current query is actually elliptical/relative
+        is_elliptical = False
+        if not place_val and not occasion_val:
+            words = query_clean.split()
+            if len(words) <= 3:
+                is_elliptical = True
+            elif any(phrase in query_clean for phrase in ["give me", "show me", "cheaper", "cheapest", "better", "larger", "smaller", "in ", "one"]):
+                is_elliptical = True
+
+        has_noun = any(noun in query_clean for noun in product_nouns)
+        if is_elliptical and not has_noun and prev_noun:
+            if prev_noun in ["saree", "sari", "sadi", "shirt", "jeans", "t-shirt", "tshirt", "dress", "jacket", "suit", "lehenga", "kurta", "frock"]:
+                category_val = "Fashion"
+            elif prev_noun in ["laptop"]:
+                category_val = "Laptops"
+            elif prev_noun in ["phone", "smartphone"]:
+                category_val = "Smartphones"
+            elif prev_noun in ["sunscreen", "rose water", "face wash", "facewash", "serum", "moisturizer", "cleanser", "toner"]:
+                category_val = "Skincare"
+            elif prev_noun in ["dumbbell", "yoga mat", "water bottle"]:
+                category_val = "Fitness"
+            elif prev_noun in ["headphone", "earbud", "watch", "smartwatch", "backpack"]:
+                category_val = "Accessories"
+                
+            if color_val:
+                search_query_val = f"{color_val.lower()} {prev_noun}"
+            else:
+                search_query_val = f"{query_clean} {prev_noun}"
+
+        min_budget_val, max_budget_val = self.parse_budget_range(query)
+
         fallback = {
             "intent": fallback_intent,
             "category": category_val,
-            "budget": self.parse_budget(query),
+            "min_budget": min_budget_val,
+            "max_budget": max_budget_val,
             "brand": brand_val,
             "features": features_list,
             "lifestyle": lifestyle_val,
@@ -840,22 +997,6 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
             "is_out_of_scope": is_out_of_scope_fallback
         }
         
-        if not self.model:
-            if self.groq_api_key:
-                logger.info("Gemini model not configured. Using Groq fallback for metadata extraction.")
-                groq_data = self._extract_entities_via_groq(query, history)
-                merged = self._merge_and_validate_nlu(groq_data, fallback)
-                if merged:
-                    return merged
-            
-            # Try other fallback LLMs (DeepSeek, Mistral, Qwen, Llama/Together)
-            logger.info("Groq failed or not configured. Trying other fallback LLMs...")
-            fallback_data = self._extract_entities_via_fallback_llms(query, history)
-            merged = self._merge_and_validate_nlu(fallback_data, fallback)
-            if merged:
-                return merged
-                
-            return fallback
 
         # Format historical turns for context
         history_context = ""
@@ -878,14 +1019,15 @@ IMPORTANT CONTEXT RULES:
    - Reset the brand, budget, size, color, lifestyle, features, and comparison targets.
    - You MUST reset and clear 'gender' (set to null if not explicitly mentioned in the new query) and DO NOT carry over any previous gender from history (e.g. do not carry over "women" or "girl" if they are now asking for general shoes or men's products).
    - You MUST reset and clear 'lifestyle', 'place', 'weather_context', 'cultural_style', 'occasion_or_festival', and 'event_requirements' to null. Do NOT carry over previous events, trips, occasions, or styles (e.g., if they previously asked about a trip to Rajasthan or Garba, discard them completely when they search for shoes, laptops, or general products).
-3. NO CONVERSATIONAL CONTAMINATION: Do not let previous constraints bleed into the new product context. The extracted metadata MUST reflect ONLY the new query unless the customer explicitly references the previous parameters (e.g., "same brand", "under that budget", "in the same size").
+3. NO CONVERSATIONAL CONTAMINATION BUT SUPPORT ELLIPTICAL QUERIES: Do not let unrelated previous constraints bleed into the new product context. However, if the customer's query is elliptical or relative (e.g. "give me black one", "show in size L", "any cheaper options?", "in blue"), you MUST carry over the primary product type/noun (e.g. "frock", "laptop", "shoes") and gender from the previous turn in the history to complete the search query.
 
 Return ONLY a JSON object with the following fields (no explanations, markdown blocks, or other text):
 {{
   "intent": "string (one of: 'greeting', 'recommendation', 'comparison', 'filtering', 'general query', 'clarification', 'out_of_scope')",
   "is_out_of_scope": "boolean (true if the query is asking for products, services, or topics completely unrelated to our store categories [Smartphones, Laptops, Fashion, Shoes, Skincare, Fitness], false otherwise)",
   "category": "string or null (strictly standard names: 'Smartphones', 'Laptops', 'Fashion', 'Shoes', 'Skincare', 'Fitness', 'Accessories'. Note: If the customer mentions a trip, travel, holiday, or visiting a place, set this to 'Fashion' or 'Accessories' depending on whether they need clothes or gear.)",
-  "budget": "number or null (extracted maximum numerical budget, convert '50k' to 50000, etc.)",
+  "min_budget": "number or null (extracted minimum numerical budget range, or null if no minimum is specified, e.g. 2000.0)",
+  "max_budget": "number or null (extracted maximum numerical budget, or null if no maximum is specified, convert '50k' to 50000, etc., e.g. 5000.0)",
   "brand": "string or null (e.g. 'Apple', 'Samsung', 'Nike', 'Minimalist')",
   "features": "array of strings (e.g. ['camera', 'battery', 'cotton', 'dry skin', 'lightweight'])",
   "lifestyle": "string or null (e.g. 'Goa trip', 'college studies', 'gym beginner', 'anti-aging')",
@@ -904,38 +1046,15 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
   "clarification_questions": "array of strings or null (if the query is vague or lacks details, provide 1-2 dynamic, category-specific clarification questions, otherwise null)"
 }}
 """
-        try:
-            response = self.model.generate_content(prompt)
-            clean_text = response.text.strip()
-            if "```json" in clean_text:
-                clean_text = clean_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in clean_text:
-                clean_text = clean_text.split("```")[1].split("```")[0].strip()
-                
-            data = json.loads(clean_text)
-            
+        system_instruction = "You are a precise JSON extractor. Analyze the customer query and chat history to extract structured shopping metadata."
+        data = self.gateway.extract_metadata(query, history, system_instruction, prompt)
+        if data:
             return self._merge_and_validate_nlu(data, fallback)
-        except Exception as e:
-            logger.error(f"Error extracting metadata via LLM: {str(e)}. Trying Groq fallback.")
-            if self.groq_api_key:
-                groq_data = self._extract_entities_via_groq(query, history)
-                merged = self._merge_and_validate_nlu(groq_data, fallback)
-                if merged:
-                    logger.info("Successfully extracted metadata via Groq fallback.")
-                    return merged
             
-            # Try other fallback LLMs (DeepSeek, Mistral, Qwen, Llama/Together)
-            logger.info("Groq failed or not configured. Trying other fallback LLMs...")
-            fallback_data = self._extract_entities_via_fallback_llms(query, history)
-            merged = self._merge_and_validate_nlu(fallback_data, fallback)
-            if merged:
-                logger.info("Successfully extracted metadata via fallback LLMs.")
-                return merged
-                
-            logger.warning("All metadata extraction fallbacks failed. Using local rule-based fallback.")
-            return fallback
+        logger.warning("All metadata extraction fallbacks failed. Using local rule-based fallback.")
+        return fallback
 
-    def get_clarification_questions(self, category: Optional[str], budget: Optional[float], brand: Optional[str]) -> List[str]:
+    def get_clarification_questions(self, category: Optional[str], min_budget: Optional[float], max_budget: Optional[float], brand: Optional[str]) -> List[str]:
         """Returns follow-up clarification questions if info is missing."""
         questions = []
         if not category:
@@ -943,14 +1062,14 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
             return questions
             
         if category == "Smartphones":
-            if not budget:
+            if not min_budget and not max_budget:
                 questions.append("What is your budget? (e.g. under ₹20,000, under ₹50,000)")
             if not brand:
                 questions.append("Do you have any brand preference? (e.g. Samsung, Apple, Vivo)")
             questions.append("What is most important to you: Camera quality, Battery life, Gaming performance, or Display?")
             
         elif category == "Laptops":
-            if not budget:
+            if not min_budget and not max_budget:
                 questions.append("What is your approximate budget? (e.g. under ₹40,000, around ₹75,000)")
             questions.append("What is your main use case: Student work, Gaming, Software Engineering, or Daily browsing?")
             
@@ -1080,7 +1199,8 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
 
         intent = meta.get("intent", "recommendation")
         category = meta.get("category")
-        budget = meta.get("budget")
+        min_budget = meta.get("min_budget")
+        max_budget = meta.get("max_budget")
         brand = meta.get("brand")
         features = meta.get("features", [])
         lifestyle = meta.get("lifestyle")
@@ -1129,7 +1249,7 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
         if intent != "greeting":
             is_vague = (
                 (len(user_query.split()) < 3 and not category and not lifestyle and not brand and not features) or 
-                (not category and intent in ["recommendation", "filtering"] and not brand and not lifestyle and not features and not budget)
+                (not category and intent in ["recommendation", "filtering"] and not brand and not lifestyle and not features and not min_budget and not max_budget)
             )
             # A query is never vague if a specific place or occasion is mentioned
             if place or occasion_or_festival:
@@ -1139,112 +1259,51 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
         comparison_data = None
         is_strictly_available = True
 
-        if not is_greeting:
-            # 2. Trigger semantic retrieval
+        if not is_greeting and intent != "out_of_scope":
+            # 2. Trigger semantic retrieval (search engine handles expansion, progressive retrieval, scraping, and ranking)
             search_query = meta.get("search_query") or user_query
             if not search_query.strip():
                 search_query = user_query
                 
             query_to_search = search_query
-            # If vague and category exists, do a default popular search for "soft recommendations"
+
+            # If vague and category exists, run popular search
             if is_vague and category:
                 query_to_search = f"best {category}"
                 
-            retrieved_products = self.search_engine.search(
-                query=query_to_search,
-                category_filter=category,
-                budget_filter=budget,
-                brand_filter=brand,
-                top_k=8,
-                exclude_brands=exclude_brands,
-                negated_features=negated_features,
-                color_filter=color,
-                size_filter=size,
-                gender_filter=gender
-            )
+            if self.is_couple_query(query_to_search):
+                retrieved_products = self._perform_dual_search(
+                    query=query_to_search,
+                    category=category,
+                    min_budget=min_budget,
+                    max_budget=max_budget,
+                    brand=brand,
+                    exclude_brands=exclude_brands,
+                    negated_features=negated_features,
+                    color=color,
+                    size=size
+                )
+            else:
+                retrieved_products = self.search_engine.search(
+                    query=query_to_search,
+                    category_filter=category,
+                    min_budget_filter=min_budget,
+                    max_budget_filter=max_budget,
+                    brand_filter=brand,
+                    top_k=8,
+                    exclude_brands=exclude_brands,
+                    negated_features=negated_features,
+                    color_filter=color,
+                    size_filter=size,
+                    gender_filter=gender
+                )
             
-            # Validate that the requested product/brand is actually available in the store
-            # Only perform strict availability check if it is NOT a vague query
-            is_strictly_available = True
-            if intent in ["recommendation", "comparison"] and not is_vague:
-                if not retrieved_products:
+            # Evaluate strict availability from the unified search result
+            if retrieved_products:
+                if retrieved_products[0].get("is_alternative") == True:
                     is_strictly_available = False
-                elif retrieved_products[0].get("semantic_score", 1.0) < 0.68:
-                    is_strictly_available = False
-                elif retrieved_products[0].get("is_alternative") == True:
-                    is_strictly_available = False
-                
-                # If a specific brand is parsed, verify we have it in stock
-                if brand and retrieved_products:
-                    brand_matched = any(
-                        brand.lower() in str(p.get("brand", "")).lower() or 
-                        str(p.get("brand", "")).lower() in brand.lower() 
-                        for p in retrieved_products[:3]
-                    )
-                    if not brand_matched:
-                        is_strictly_available = False
-
-                # Check for place or event-specific keyword matching to prevent hallucinations on unavailable items
-                if is_strictly_available and retrieved_products:
-                    match_keywords = []
-                    if place:
-                        match_keywords.append(place.lower())
-                        if place.lower() == "rajasthan" or place.lower() == "rajasthani":
-                            match_keywords.extend(["rajasthan", "rajasthani", "jaipur", "bandhani", "block print", "ethnic"])
-                        elif place.lower() == "kashmir" or place.lower() == "kashmiri":
-                            match_keywords.extend(["kashmir", "kashmiri", "pheran", "pashmina", "wool"])
-                        elif place.lower() == "goa" or place.lower() == "goan":
-                            match_keywords.extend(["goa", "goan", "beachwear", "beach", "floral"])
-                    if occasion_or_festival:
-                        match_keywords.append(occasion_or_festival.lower())
-                        if "garba" in occasion_or_festival.lower() or "navratri" in occasion_or_festival.lower():
-                            match_keywords.extend(["garba", "navratri", "chaniya", "lehenga", "saree", "ethnic"])
-                        elif "school" in occasion_or_festival.lower():
-                            match_keywords.extend(["school", "uniform", "backpack", "shoes"])
-                        elif "interview" in occasion_or_festival.lower() or "office" in occasion_or_festival.lower():
-                            match_keywords.extend(["interview", "office", "formal", "suit", "blazer", "shirt"])
-                            
-                    query_words = re.findall(r"\b[a-zA-Z]{3,}\b", user_query.lower())
-                    stop_words = {
-                        "the", "and", "for", "with", "under", "over", "above", "below", "from", "about",
-                        "best", "good", "cheap", "nice", "great", "show", "find", "suggest", "recommend",
-                        "wear", "clothes", "clothing", "item", "items", "product", "products", "buy", "shop",
-                        "look", "looking", "want", "need", "search", "store", "online", "flipkart", "please",
-                        "some", "many", "more", "most", "what", "which", "who", "whom", "this", "that", "these",
-                        "those", "here", "there", "when", "where", "why", "how", "are", "was", "were", "have",
-                        "has", "had", "does", "did", "doing", "would", "should", "could", "must"
-                    }
-                    for qw in query_words:
-                        if qw not in stop_words and len(qw) > 3:
-                            match_keywords.append(qw)
-                            
-                    specific_terms = list(set([kw for kw in match_keywords if len(kw) > 3]))
-                    for term in specific_terms:
-                        if term in [
-                            "casual", "formal", "dress", "shirt", "suit", "jacket", "active", "style",
-                            "cold", "warm", "hot", "cool", "summer", "winter", "spring", "autumn",
-                            "weather", "climate", "feel", "feeling", "going", "trip", "travel", 
-                            "holiday", "vacation", "tour", "visit", "visiting", "tomorrow", "today", 
-                            "yesterday", "love", "like", "want", "need", "suggest", "recommend"
-                        ]:
-                            continue
-                        term_found = False
-                        for p in retrieved_products[:3]:
-                            prod_title = str(p.get("product_title", "")).lower()
-                            prod_desc = str(p.get("description", "")).lower()
-                            prod_brand = str(p.get("brand", "")).lower()
-                            prod_specs = str(p.get("specifications", "")).lower()
-                            prod_cat = str(p.get("category", "")).lower()
-                            if (term in prod_title or 
-                                term in prod_desc or 
-                                term in prod_brand or 
-                                term in prod_cat or
-                                term in prod_specs):
-                                term_found = True
-                                break
-                        if not term_found:
-                            is_strictly_available = False
-                            break
+            else:
+                is_strictly_available = False
 
             # 4. Handle comparisons
             if intent == "comparison" or len(comparison_targets) >= 2:
@@ -1258,7 +1317,7 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
             clarifications = [q for q in meta.get("clarification_questions") if q]
             
         if not clarifications and (is_vague or (intent == "clarification") or (not category and not retrieved_products and not is_greeting)):
-            clarifications = self.get_clarification_questions(category, budget, brand)
+            clarifications = self.get_clarification_questions(category, min_budget, max_budget, brand)
 
         # 5. Generate conversational response
         response_content = ""
@@ -1295,7 +1354,8 @@ Return ONLY a JSON object with the following fields (no explanations, markdown b
         prompt = f"""
 CONTEXT INFORMATION:
 - Intended category: {category}
-- Target budget: {budget}
+- Target minimum budget: {min_budget}
+- Target maximum budget: {max_budget}
 - Brand preference: {brand}
 - Lifestyle / Use Case: {lifestyle}
 - Extracted features: {features}
@@ -1330,56 +1390,18 @@ IMPORTANT CONVERSATIONAL RULES (STRICTLY OBSERVE):
 6. Do not mention "database", "is_strictly_available", "filters", or "alternative flags". Talk like a helpful, warm store associate.
 """
 
-        if self.model:
-            try:
-                # Map history roles ('assistant' -> 'model') for Gemini chat session
-                formatted_history = []
-                for turn in history[-6:]:
-                    role = "user" if turn["role"] == "user" else "model"
-                    formatted_history.append({
-                        "role": role,
-                        "parts": [turn["content"]]
-                    })
-                chat_session = self.model.start_chat(history=formatted_history)
-                response = chat_session.send_message(prompt)
-                response_content = response.text.strip()
-            except Exception as e:
-                logger.error(f"Error generating LLM response via Gemini: {str(e)}. Trying Groq fallback.")
-                groq_response = self._generate_response_via_groq(user_query, history, prompt)
-                if groq_response:
-                    logger.info("Successfully generated response via Groq fallback.")
-                    response_content = groq_response
-                else:
-                    logger.info("Groq failed. Trying fallback LLMs (DeepSeek, Mistral, Qwen, Llama/Together)...")
-                    fallback_response = self._generate_response_via_fallback_llms(user_query, history, prompt)
-                    if fallback_response:
-                        response_content = fallback_response
-                    else:
-                        logger.warning("All response generation fallbacks failed. Using offline fallback response.")
-                        response_content = self._get_fallback_mock_response(user_query, intent, retrieved_products, clarifications, is_strictly_available=is_strictly_available, place=place, occasion_or_festival=occasion_or_festival)
-        else:
-            # Gemini not configured
-            groq_response = None
-            if self.groq_api_key:
-                logger.info("Gemini not configured. Generating response directly via Groq.")
-                groq_response = self._generate_response_via_groq(user_query, history, prompt)
-                
-            if groq_response:
-                logger.info("Successfully generated response directly via Groq.")
-                response_content = groq_response
-            else:
-                logger.info("Groq not configured or failed. Trying fallback LLMs (DeepSeek, Mistral, Qwen, Llama/Together)...")
-                fallback_response = self._generate_response_via_fallback_llms(user_query, history, prompt)
-                if fallback_response:
-                    response_content = fallback_response
-                else:
-                    logger.warning("All response generation fallbacks failed. Using offline fallback response.")
-                    response_content = self._get_fallback_mock_response(user_query, intent, retrieved_products, clarifications, is_strictly_available=is_strictly_available, place=place, occasion_or_festival=occasion_or_festival)
+        # Generate response via LLM rotating gateway
+        response_content = self.gateway.generate_response(user_query, history, self.system_instruction, prompt)
+        if not response_content:
+            logger.warning("All response generation fallbacks failed. Using offline fallback response.")
+            response_content = self._get_fallback_mock_response(user_query, intent, retrieved_products, clarifications, is_strictly_available=is_strictly_available, place=place, occasion_or_festival=occasion_or_festival)
 
         return {
             "intent": intent,
             "category": category,
-            "budget": budget,
+            "min_budget": min_budget,
+            "max_budget": max_budget,
+            "budget": max_budget or min_budget,
             "brand": brand,
             "features": features,
             "lifestyle": lifestyle,
